@@ -1,0 +1,43 @@
+# ─── Deployment Frontend ─────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: 648985348753.dkr.ecr.us-east-1.amazonaws.com/frontend-despacho:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+# ─── Service Frontend (expuesto públicamente vía LoadBalancer) ────────────────
+# AWS creará automáticamente un Application Load Balancer
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+  # LoadBalancer: AWS provisiona un ALB con IP pública
+  type: LoadBalancer
+

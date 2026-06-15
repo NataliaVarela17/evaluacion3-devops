@@ -1,0 +1,172 @@
+name: CI/CD Pipeline - Deploy to EKS
+
+# Se dispara solo cuando hay push a la rama deploy
+on:
+  push:
+    branches:
+      - deploy
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: despacho-cluster
+
+jobs:
+  # ─── JOB 1: Build y Push de las imágenes a ECR ───────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Frontend ──────────────────────────────────────────────────────────
+      - name: Build y Push imagen Frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/frontend-despacho:$IMAGE_TAG \
+                       -t $ECR_REGISTRY/frontend-despacho:latest \
+                       ./evaluacion2/front_despacho
+          docker push $ECR_REGISTRY/frontend-despacho:$IMAGE_TAG
+          docker push $ECR_REGISTRY/frontend-despacho:latest
+
+      # ── Backend Despachos ─────────────────────────────────────────────────
+      - name: Build y Push imagen Backend Despachos
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/backend-despachos:$IMAGE_TAG \
+                       -t $ECR_REGISTRY/backend-despachos:latest \
+                       ./evaluacion2/back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO
+          docker push $ECR_REGISTRY/backend-despachos:$IMAGE_TAG
+          docker push $ECR_REGISTRY/backend-despachos:latest
+
+      # ── Backend Ventas ────────────────────────────────────────────────────
+      - name: Build y Push imagen Backend Ventas
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/backend-ventas:$IMAGE_TAG \
+                       -t $ECR_REGISTRY/backend-ventas:latest \
+                       ./evaluacion2/back-Ventas_SpringBoot/Springboot-API-REST
+          docker push $ECR_REGISTRY/backend-ventas:$IMAGE_TAG
+          docker push $ECR_REGISTRY/backend-ventas:latest
+
+  # ─── JOB 2: Deploy al clúster EKS ────────────────────────────────────────
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configurar kubectl para EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER }}
+
+      - name: Reemplazar ACCOUNT_ID en los manifests
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          sed -i "s|ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com|$ECR_REGISTRY|g" k8s/backend-despachos.yml
+          sed -i "s|ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com|$ECR_REGISTRY|g" k8s/backend-ventas.yml
+          sed -i "s|ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com|$ECR_REGISTRY|g" k8s/frontend.yml
+
+      - name: Aplicar manifests (MySQL primero)
+        run: |
+          kubectl apply -f k8s/mysql.yml
+          kubectl rollout status deployment/mysql --timeout=300s
+
+      - name: Aplicar manifests Backends
+        run: |
+          kubectl apply -f k8s/backend-despachos.yml
+          kubectl apply -f k8s/backend-ventas.yml
+          kubectl rollout status deployment/backend-despachos --timeout=300s
+          kubectl rollout status deployment/backend-ventas --timeout=300s
+
+      - name: Aplicar manifest Frontend
+        run: |
+          kubectl apply -f k8s/frontend.yml
+          kubectl rollout status deployment/frontend --timeout=300s
+
+      - name: Aplicar HPA (autoscaling)
+        run: |
+          kubectl apply -f k8s/hpa.yml
+          kubectl get hpa
+
+      # ── Verificar logs de los pods (IE6) ─────────────────────────────────
+      - name: Verificar logs de los servicios
+        run: |
+          echo "=== Logs Backend Despachos ==="
+          kubectl logs deployment/backend-despachos --tail=30
+          echo ""
+          echo "=== Logs Backend Ventas ==="
+          kubectl logs deployment/backend-ventas --tail=30
+          echo ""
+          echo "=== Logs Frontend ==="
+          kubectl logs deployment/frontend --tail=20
+
+      # ── Verificar comunicación Front → Back (IE7) ─────────────────────────
+      - name: Verificar estado de los pods y servicios
+        run: |
+          echo "=== Pods corriendo ==="
+          kubectl get pods -o wide
+          echo ""
+          echo "=== Servicios y puertos ==="
+          kubectl get services
+          echo ""
+          echo "=== HPA estado ==="
+          kubectl get hpa
+
+      # ── Demostrar recuperación ante redeploy (IE7) ────────────────────────
+      - name: Demostrar recuperación ante redeploy
+        run: |
+          echo "=== Eliminando un pod para demostrar autorecuperación ==="
+          POD=$(kubectl get pods -l app=backend-despachos -o jsonpath='{.items[0].metadata.name}')
+          kubectl delete pod $POD
+          echo "Pod $POD eliminado. Kubernetes lo recreará automáticamente."
+          sleep 15
+          echo ""
+          echo "=== Pods después de la eliminación (debería haber uno nuevo) ==="
+          kubectl get pods -l app=backend-despachos
+
+      # ── URL pública del frontend ──────────────────────────────────────────
+      - name: Mostrar URL pública del Frontend
+        run: |
+          echo "Esperando que el LoadBalancer obtenga IP pública..."
+          sleep 30
+          echo "=== URL pública del Frontend ==="
+          kubectl get service frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+          echo ""
